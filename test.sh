@@ -18,6 +18,7 @@ test_sources=(
     tests/map_touch_routing_test.cpp
     tests/map_touch_state_test.cpp
     tests/mouse_drag_state_test.cpp
+    tests/native_original_motion_state_test.cpp
     tests/presentation_policy_test.cpp
     tests/ps_audio_signal_test.cpp
     tests/scroll_router_test.cpp

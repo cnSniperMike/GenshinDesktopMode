@@ -7,6 +7,8 @@
 #include "native_signal.h"
 #include "live_event_map.h"
 #include "native_code_patch.h"
+#include "native_original_motion.h"
+
 namespace NativeLive {
 using Dispatch=NativeMotion::ImmediateDispatcher<>;
 static NativeMotion::SDKRelay relay;
@@ -47,6 +49,9 @@ static void Stop(void *,uint32_t id,int transition,int curve){
 static Dispatch dispatcher(LiveEventMap,sizeof(LiveEventMap)/sizeof(*LiveEventMap),{nullptr,Post,Stop});
 static void SetAllowed(bool value){
     allowed=value;bool next=value&&ready.load();capabilities.request(next);
+    #if GDM_NATIVE_PRODUCT
+    NativeOriginalMotion::Request(next);
+    #endif
     // Revoke immediately on a disconnect, focus/mode change or user disable.
     // Enabling waits until the isolated capability commands were submitted.
     if(!next){signal.setEnabled(false);dispatcher.setEnabled(false);}
@@ -71,6 +76,9 @@ static void SyncCapabilities(){
 }
 static bool Read(PSAudioPair &pair){return signal.read(pair);}
 static void Observe(uint32_t event,uint64_t owner,uint32_t playing,uint32_t type,uint64_t value){
+    #if GDM_NATIVE_PRODUCT
+    NativeOriginalMotion::ObserveEvent(event);
+    #endif
     size_t lo=EventIndex(event);
     if(lo<EventCount){
         ++mappedSeen;if(!playing)++mappedOriginalFailed;if(!allowed.load())++mappedWhileDisabled;
@@ -82,6 +90,9 @@ static void ObserveStop(uint32_t id,int transition,int curve){
     if(dispatcher.stopOriginal(id,transition,curve))++stopObserved;
 }
 static uint32_t EnginePost(uint32_t e,uint64_t o,uint32_t flags,void *callback,void *cookie,void *params,uint32_t requested){
+    #if GDM_NATIVE_PRODUCT
+    if(!NativeMotion::EngineRelay::privateDepth)NativeOriginalMotion::Prime();
+    #endif
     auto pending=dispatcher.begin(NativeMotion::EngineRelay::privateDepth?0:e);
     return engineRelay.post(e,o,flags,callback,cookie,params,requested);
 }
@@ -98,10 +109,18 @@ static bool InstallRelay(){
     auto s=NativeCodePatch::Install(F<void *>(0x1108e1254),(void *)SDKStop,stopPrefix,relay.originalStop);
     if(!s)return false;
     engineRelay.observe=Observe;relay.observeStop=ObserveStop;
+    #if GDM_NATIVE_PRODUCT
+    NativeOriginalMotion::actionRelay.replacementReady=[](){
+        return ready.load()&&allowed.load()&&capabilities.active()&&NativeOriginalMotion::capabilities.active();
+    };
+    #endif
     W(@"native_live event_entry=shared_native_postevent sdk_and_direct_callers=1 private_posts_excluded=1 preserve_emitter_command_order=1 timer_starts_no_events=1");
     return true;
 }
 static void Status(){
+    #if GDM_NATIVE_PRODUCT
+    NativeOriginalMotion::Status();
+    #endif
     W(@"native_live status phase=%u game_calls=%llu submitted=%llu native_posts=%llu failed=%llu stop_seen=%llu ended=%llu active=%zu drops=%llu pcm_frames=%llu pcm_rejected=%llu output_allowed=%d physical_feedback_verified=0 original_failed=%llu external_calls=%llu mapped_seen=%llu mapped_original_failed=%llu mapped_disabled=%llu",
       phase,engineRelay.calls.load(),submitted.load(),posted.load(),failed.load(),stopObserved.load(),endCallbacks.load(),
       dispatcher.active(),dispatcher.dropped(),pcmFrames.load(),pcmRejected.load(),allowed.load(),engineRelay.failed.load(),engineRelay.externalCalls.load(),mappedSeen.load(),mappedOriginalFailed.load(),mappedWhileDisabled.load());
@@ -179,5 +198,8 @@ static void Tick(){
         int b=F<int (*)(void *,uint32_t)>(0x1108545c8)(loader,bank),p=F<int (*)(void *,uint32_t)>(0x110854330)(loader,package);
         W(@"native_live cleanup bank=%d package=%d",b,p);phase=5;Status();
     }
+    #if GDM_NATIVE_PRODUCT
+    NativeOriginalMotion::Sync();
+    #endif
 }
 }

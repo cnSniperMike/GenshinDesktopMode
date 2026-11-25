@@ -3,15 +3,20 @@ struct OutputSettings {uint32_t shareset,device,panning,channels;};
 struct EmptySet {alignas(16) uint8_t storage[64]{};};
 static std::atomic<unsigned> request{0},phase{0};
 static std::atomic<int> result{0};
+static std::atomic<void *> nativeDevice{nullptr};
+static void (*observeRender)();
 static uint64_t outputId,silentOutputId;
 static bool motionCreated,silentCreated;
 static constexpr uint32_t shareset=0xfd4d0061,silentShareset=0xfd4d0062;
 static void Remove(){
+    nativeDevice=nullptr;
     if(silentCreated){F<void (*)(uint64_t,bool)>(0x1109220e4)(silentOutputId,false);silentCreated=false;}
     if(motionCreated){F<void (*)(uint64_t,bool)>(0x1109220e4)(outputId,false);motionCreated=false;}
 }
 static void Callback(void *,unsigned location,void *){
-    if(location!=4)return;unsigned command=request.exchange(0);
+    if(location!=4)return;
+    if(observeRender)observeRender();
+    unsigned command=request.exchange(0);
     if(command==1){
         outputId=F<uint64_t (*)(uint32_t,uint32_t)>(0x1108e12bc)(shareset,0);
         silentOutputId=F<uint64_t (*)(uint32_t,uint32_t)>(0x1108e12bc)(silentShareset,0);
@@ -22,6 +27,7 @@ static void Callback(void *,unsigned location,void *){
         SinkObserver::selectPrivate=true;
         int motion=F<int (*)(OutputSettings *,void *)>(0x1109222ac)(&settings,&listeners);
         SinkObserver::selectPrivate=false;motionCreated=motion==1;
+        if(motionCreated)nativeDevice=F<void *(*)(uint64_t)>(0x110922358)(outputId);
         int silent=-1;
         if(motionCreated){
             // Ordinary sibling PCM is consumed by an independent native Dummy

@@ -78,6 +78,9 @@ static void InstallNativeProductBackend(void (*settingsChanged)(bool)=nullptr){
     if(!NativeCodeProfile()){Log(@"native_motion disabled=1 reason=code_profile_mismatch");return;}
     Log(@"native_motion client_profile=%@ verified=1",IsGlobalModernRuntime()?@"global":@"cn");
     if(!SinkObserver::Install()){Log(@"native_motion disabled=1 reason=sink_binding");return;}
+    #if GDM_NATIVE_PRODUCT
+    NativeOriginalMotion::Install();
+    #endif
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{PrepareNativeResource();});
     [NSTimer scheduledTimerWithTimeInterval:.02 repeats:YES block:^(NSTimer *timer){
         static bool begun=false;static unsigned status=0;
