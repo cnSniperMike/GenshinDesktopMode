@@ -216,9 +216,11 @@ static void SchedulePoll(void) {
     [NSRunLoop.mainRunLoop addTimer:pollTimer forMode:NSRunLoopCommonModes];
 }
 static id ObserveEvent(id event) {
+    NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
+    bool motion=type==5 || type==6 || type==7 || type==27;
+    if (motion && !tracked.count && !pending.pending && !NativeBridge::controllerInputActive) return event;
     if(!NativeBridge::IsForeground()||!NativeGameWindow()||NativeBridge::nativeOverlayActive)return event;
     id window=((id (*)(id,SEL))objc_msgSend)(event,sel_registerName("window"));
-    NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
     if(!window&&(type==10||type==12)) {
         id game=NativeGameWindow();
         if(game&&((BOOL (*)(id,SEL))objc_msgSend)(game,sel_registerName("isKeyWindow")))window=game;

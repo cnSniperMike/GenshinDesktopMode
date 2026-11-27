@@ -44,6 +44,7 @@ static void Log(NSString *format, ...) {
 #include "native_character_pointer.h"
 #include "native_map_drag.h"
 #include "control_device.h"
+#include "title_quit.h"
 #include "desktop_ui_geometry.h"
 
 #define GDM_NATIVE_PRODUCT 1

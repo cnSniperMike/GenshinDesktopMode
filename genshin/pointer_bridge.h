@@ -10,6 +10,8 @@
 #include "native_web_style.h"
 #include "native_web_escape.h"
 #include <cmath>
+#include "mac_pointer_host.h"
+#include "native_cursor.h"
 
 static std::atomic<int64_t> rawMotionX{0},rawMotionY{0};
 
@@ -20,23 +22,24 @@ static std::atomic<int> cursorLockMode{0};
 static NSMutableArray<UIPointerInteraction *> *desktopPointerInteractions;
 static bool cameraCursorHidden;
 static bool tabCursorRequested;
-static UIImage *gamePointerImage;
-static CGPoint gamePointerHotspot;
-static UIImageView *gamePointerOverlay;
-static std::atomic<bool> mapRendersCursor{false};
-static std::atomic<int> gameCursorTextureID{0};
-static std::atomic<float> cursorWidthUV{0},cursorHeightUV{0},cursorHotXUV{0},cursorHotYUV{0};
-static __weak UIWindow *wishPointerWindow;
-static UIImageView *wishPointerOverlay;
+static NSData *gameCursorPNG;
+static CGSize gameCursorSize;
+static CGPoint gameCursorHotspot;
+static id loginNativeCursor, gameNativeCursor, ownedNativeCursor;
+static __weak id gameHostWindow;
+static NSUInteger menuTrackingDepth;
+static bool waitForContent;
+namespace TitleQuit { static bool Handle(id window,id event,bool down); }
 static UIView *FindUnityView(UIView *view);
-static void ApplyGameCursorShape(const CGRect *eventBounds=nullptr);
+static void UpdateCursorImage(const CGRect *eventBounds=nullptr, const CGPoint *eventPoint=nullptr);
+static void RefreshMacPointerHost(id eventWindow=nil);
 static void RefreshPointerStateNow(void);
 #include "native_account_input.h"
 static void UpdateNativeOverlayState(void);
 static bool WantsVisibleCursor(void);
 static bool nativePointerCaptured;
 static bool pointerCaptureSuspended;
-static bool gameplayPointerStarted;
+static std::atomic<bool> gameplayPointerStarted{false};
 static CGPoint capturedPointer;
 static DesktopMotion desktopMotion;
 static bool desktopMapMotionBatched;
@@ -45,7 +48,7 @@ static id capturedNativeWindow;
 static bool previousMouseMovedEvents;
 static id freeNativeWindow;
 static bool previousFreeMouseMovedEvents;
-static bool nativeShapeTransparent;
+static bool capturedCursorRects;
 static id transparentNativeCursor;
 static void (*originalCursorSet)(id,SEL);
 static void (*originalWindowSendEvent)(id,SEL,id);
@@ -68,13 +71,7 @@ static bool ControllerOwnsGamePointer(void) {
 }
 
 static id NativeGameWindow(void) {
-    Class appClass=NSClassFromString(@"NSApplication");
-    id app=((id (*)(id,SEL))objc_msgSend)(appClass,sel_registerName("sharedApplication"));
-    id window=((id (*)(id,SEL))objc_msgSend)(app,sel_registerName("keyWindow"));
-    if(!window) return nil;
-    // NSApplication owns this key window. A translated/custom title is not a
-    // reliable game identity check; the plugin already verified the process.
-    return window;
+    return NativeBridge::macWindowSuspended.load() ? nil : gameHostWindow;
 }
 static bool DesktopWebAppIsActive(void) {
     // A native SDK web page can deactivate the Unity UIKit scene while its
@@ -172,25 +169,11 @@ static int WarpDesktopPointer(CGPoint point) {
     if(!result) desktopMotion.didWarp({point.x,point.y});
     return result;
 }
-static bool UsesTransparentCursor(void) {
-    if(ControllerOwnsGamePointer()) return false;
-    if(pointerCaptureSuspended || !NativeBridge::IsForeground()) return false;
-    if(nativePointerCaptured) return true;
-    CGRect bounds;
-    return gameplayPointerStarted && WantsVisibleCursor() && GameContentBounds(bounds) &&
-        CGRectContainsPoint(bounds,DesktopMouseLocation());
-}
-static void SetGuardedCursor(id cursor,SEL selector) {
-    // Native HTML pickers may request an AppKit arrow outside the document's
-    // CSS. Replace that request only inside the visible game/web content. Do
-    // not force a cursor after mouse dispatch or touch the hide/unhide count.
-    CGRect bounds;
-    bool webGold=desktopWebGoldCursor && NativeBridge::nativeOverlayActive &&
-        DesktopWebAppIsActive() &&
-        GameContentBounds(bounds) && CGRectContainsPoint(bounds,DesktopMouseLocation());
-    if(transparentNativeCursor && UsesTransparentCursor()) cursor=transparentNativeCursor;
-    else if(webGold) cursor=desktopWebGoldCursor;
-    originalCursorSet(cursor,selector);
+static void SetGuardedCursor(id cursor, SEL selector) {
+    if (NSThread.isMainThread && ownedNativeCursor && !NativeBridge::macWindowSuspended.load()) {
+        cursor = ownedNativeCursor;
+    }
+    originalCursorSet(cursor, selector);
 }
 static void InstallNativeCursorGuard(void) {
     Class cursorClass=NSClassFromString(@"NSCursor");
@@ -208,7 +191,8 @@ static void InstallNativeCursorGuard(void) {
     transparentNativeCursor=((id (*)(id,SEL,id,CGPoint))objc_msgSend)(cursor,sel_registerName("initWithImage:hotSpot:"),nativeImage,CGPointZero);
     if(!transparentNativeCursor) return;
     originalCursorSet=(void (*)(id,SEL))method_setImplementation(method,(IMP)SetGuardedCursor);
-    Log(@"cursor_native_guard installed=1 transparent=1");
+    loginNativeCursor = MakeDesktopNativeCursor(LoginArrowPNG(), CGSizeMake(32,32), CGPointMake(2,2));
+    Log(@"cursor_presentation backend=NSCursor login=%d", loginNativeCursor != nil);
 }
 static void PlaceConfinedPointer(CGPoint point,const CGRect &bounds,bool syncPhysical=true) {
     // Keep clicks away from the titlebar, window borders and adjacent apps.
@@ -218,7 +202,7 @@ static void PlaceConfinedPointer(CGPoint point,const CGRect &bounds,bool syncPhy
     if(syncPhysical) WarpDesktopPointer(point);
     NativeBridge::Position((point.x-bounds.origin.x)/bounds.size.width,
         1.0-(point.y-bounds.origin.y)/bounds.size.height);
-    ApplyGameCursorShape();
+    UpdateCursorImage();
 }
 static void ReleasePointerCapture(void) {
     if(!nativePointerCaptured) return;
@@ -227,16 +211,11 @@ static void ReleasePointerCapture(void) {
     desktopDragSequence.reset();
     desktopMotionSequence.reset();
     desktopTouchHistory.reset();
-    gamePointerOverlay.hidden=YES;
     if(capturedNativeWindow) {
-        ((void (*)(id,SEL))objc_msgSend)(capturedNativeWindow,sel_registerName("enableCursorRects"));
+        if (capturedCursorRects) MacPointerSend<void>(capturedNativeWindow, "enableCursorRects");
+        capturedCursorRects = false;
         ((void (*)(id,SEL,BOOL))objc_msgSend)(capturedNativeWindow,sel_registerName("setAcceptsMouseMovedEvents:"),previousMouseMovedEvents);
         capturedNativeWindow=nil;
-    }
-    if(originalCursorSet) {
-        id arrow=((id (*)(id,SEL))objc_msgSend)(NSClassFromString(@"NSCursor"),sel_registerName("arrowCursor"));
-        originalCursorSet(arrow,sel_registerName("set"));
-        nativeShapeTransparent=false;
     }
     CGPoint point=DesktopMouseLocation();desktopMotion.reset({point.x,point.y});
     Log(@"pointer_capture enabled=0 result=%d",result);
@@ -281,35 +260,14 @@ static void SyncFreeDesktopPointer(const CGPoint *eventLocation=nullptr) {
     NativeBridge::Position((capturedPointer.x-bounds.origin.x)/bounds.size.width,
         1.0-(capturedPointer.y-bounds.origin.y)/bounds.size.height);
     // Use the same viewport for hit testing and drawing this packet.
-    ApplyGameCursorShape(eventLocation?&bounds:nullptr);
-}
-static void PaintMapPointerFrame(void) {
-    // Coalesced on the UI run loop.
-    // Draw the last absolute drag event received by the game window.
-    if(!NativeBridge::mapDragActive||NativeBridge::nativeOverlayActive||ControllerOwnsGamePointer()||
-       pointerCaptureSuspended||!WantsVisibleCursor()||!NativeBridge::IsForeground()||
-       !desktopMapFrameWindow||desktopMapFrameWindow!=NativeGameWindow()) {desktopMapFrame.cancel();return;}
-    CGRect bounds;
-    if(!GameContentBounds(bounds)){desktopMapFrame.cancel();return;}
-    desktopMapFrame.publish(bounds.origin.x,bounds.origin.y,bounds.size.width,bounds.size.height,
-        NativeBridge::mapFocusRevision.load());
-    double x,y;
-    if(!desktopMapFrame.drawPoint(x,y))return;
-    capturedPointer=CGPointMake(x,y);
-    if(desktopMapMotionBatched){desktopMotion.reset({capturedPointer.x,capturedPointer.y});desktopMapMotionBatched=false;}
-    ApplyGameCursorShape(&bounds);
-}
-static void QueueMapPointerPaint(void) {
-    static std::atomic<bool> pending{false};
-    if(pending.exchange(true))return;
-    dispatch_async(dispatch_get_main_queue(), ^{PaintMapPointerFrame();pending=false;});
+    UpdateCursorImage(&bounds, &capturedPointer);
 }
 static void ReconcilePointerCapture(void) {
     CGRect bounds;
     bool webFocus=NativeBridge::nativeOverlayActive.load()&&DesktopWebAppIsActive();
     bool manage=(webFocus||(!ControllerOwnsGamePointer() && gameplayPointerStarted && !pointerCaptureSuspended &&
         NativeBridge::IsForeground())) && GameContentBounds(bounds);
-    if(!manage) {ReleasePointerCapture();ReleaseFreePointerTracking();return;}
+    if(!NativeGameWindow() || !manage) {ReleasePointerCapture();ReleaseFreePointerTracking();return;}
     if(webFocus || WantsVisibleCursor()) {
         ReleasePointerCapture();
         id window=NativeGameWindow();
@@ -328,13 +286,16 @@ static void ReconcilePointerCapture(void) {
     ReleaseFreePointerTracking();
     if(!associatePointer || !warpPointer) return;
     if(!nativePointerCaptured) {
+        if (waitForContent && !CGRectContainsPoint(bounds, DesktopMouseLocation())) return;
+        waitForContent = false;
         int result=associatePointer(false);
         if(result) {Log(@"pointer_capture failed=%d",result);return;}
         nativePointerCaptured=true;
         capturedNativeWindow=NativeGameWindow();
         previousMouseMovedEvents=((BOOL (*)(id,SEL))objc_msgSend)(capturedNativeWindow,sel_registerName("acceptsMouseMovedEvents"));
         ((void (*)(id,SEL,BOOL))objc_msgSend)(capturedNativeWindow,sel_registerName("setAcceptsMouseMovedEvents:"),YES);
-        ((void (*)(id,SEL))objc_msgSend)(capturedNativeWindow,sel_registerName("disableCursorRects"));
+        capturedCursorRects = MacPointerSend<BOOL>(capturedNativeWindow, "areCursorRectsEnabled");
+        if (capturedCursorRects) MacPointerSend<void>(capturedNativeWindow, "disableCursorRects");
         CGPoint point=DesktopMouseLocation();desktopMotion.reset({point.x,point.y});
         PlaceConfinedPointer(CGPointMake(CGRectGetMidX(bounds),CGRectGetMidY(bounds)),bounds);
         Log(@"pointer_capture enabled=1 result=0 bounds=(%.0f,%.0f,%.0f,%.0f)",
@@ -360,124 +321,45 @@ static void CenterDesktopPointer(void) {
     capturedPointer=CGPointMake(CGRectGetMidX(bounds),CGRectGetMidY(bounds));
     Log(@"cursor_centered result=%d",WarpDesktopPointer(capturedPointer));
 }
-static void ApplyGameCursorShape(const CGRect *eventBounds) {
-    // The SDK presents wish history above UnityView. A cursor inside Unity's
-    // subtree is covered by that modal, even with a high layer zPosition.
-    // Draw only the image in the web page's existing UIWindow; never create
-    // an input window or attach gestures/pointer interactions to the page.
-    UIWindow *webWindow=NativeBridge::nativeOverlayActive.load()?wishPointerWindow:nil;
-    if(webWindow) {
-        gamePointerOverlay.hidden=YES;
-        CGRect bounds;
-        CGPoint mouse=DesktopMouseLocation();
-        bool visible=gamePointerImage && !pointerCaptureSuspended && DesktopWebAppIsActive() &&
-            GameContentBounds(bounds,false) && CGRectContainsPoint(bounds,mouse);
-        if(!visible) {wishPointerOverlay.hidden=YES;return;}
-        CGPoint point=CGPointMake(webWindow.bounds.origin.x+(mouse.x-bounds.origin.x)/bounds.size.width*webWindow.bounds.size.width,
-            webWindow.bounds.origin.y+(mouse.y-bounds.origin.y)/bounds.size.height*webWindow.bounds.size.height);
-        if(!wishPointerOverlay) {
-            wishPointerOverlay=[[UIImageView alloc] initWithImage:gamePointerImage];
-            wishPointerOverlay.userInteractionEnabled=NO;
-            wishPointerOverlay.accessibilityElementsHidden=YES;
-            wishPointerOverlay.contentMode=UIViewContentModeScaleToFill;
-            wishPointerOverlay.layer.zPosition=10000;
-        }
-        if(wishPointerOverlay.superview!=webWindow) {
-            UIView *before=[webWindow hitTest:point withEvent:nil];
-            [webWindow addSubview:wishPointerOverlay];
-            UIView *after=[webWindow hitTest:point withEvent:nil];
-            Log(@"wish_cursor_window attached=1 input_passthrough=%d host=%@",before==after,NSStringFromClass(webWindow.class));
-        }
-        [UIView performWithoutAnimation:^{
-            wishPointerOverlay.image=gamePointerImage;
-            wishPointerOverlay.frame=CGRectMake(point.x-gamePointerHotspot.x,point.y-gamePointerHotspot.y,
-                gamePointerImage.size.width,gamePointerImage.size.height);
-            wishPointerOverlay.hidden=NO;
-        }];
+static void SetOwnedCursor(id desired) {
+    if (!originalCursorSet) return;
+    id previous = ownedNativeCursor;
+    ownedNativeCursor = desired;
+    if (desired) ApplyDesktopNativeCursor(desired, originalCursorSet, previous != desired);
+    else if (previous)
+        originalCursorSet(MacPointerSend(NSClassFromString(@"NSCursor"), "arrowCursor"), sel_registerName("set"));
+    if (previous != desired)
+        Log(@"cursor_owner shape=%s", !desired ? "system" : desired == transparentNativeCursor ? "hidden" : "game");
+}
+
+static void UpdateCursorImage(const CGRect *eventBounds, const CGPoint *eventPoint) {
+    if (!NSThread.isMainThread || !originalCursorSet) return;
+    if (!NativeGameWindow() || ControllerOwnsGamePointer() ||
+        (pointerCaptureSuspended && !NativeBridge::nativeOverlayActive)) {
+        SetOwnedCursor(nil);
         return;
     }
-    if(wishPointerOverlay.superview) [wishPointerOverlay removeFromSuperview];
-    bool visible=!ControllerOwnsGamePointer() && gamePointerImage && gameplayPointerStarted && !pointerCaptureSuspended &&
-        WantsVisibleCursor() && NativeBridge::IsForeground();
-    if(!visible) {gamePointerOverlay.hidden=YES;return;}
+    if (nativePointerCaptured && !WantsVisibleCursor()) {
+        SetOwnedCursor(transparentNativeCursor);
+        return;
+    }
     CGRect bounds;
-    if(eventBounds) bounds=*eventBounds;
-    else if(!GameContentBounds(bounds)) {gamePointerOverlay.hidden=YES;return;}
-    if(!CGRectContainsPoint(bounds,capturedPointer)) {gamePointerOverlay.hidden=YES;return;}
-    UIView *host=gamePointerOverlay.superview;
-    if(!host || !host.window) {
-        host=nil;
-        for(UIWindow *window in UIApplication.sharedApplication.windows)
-            if((host=FindUnityView(window))) break;
-        if(!host) return;
-        if(!gamePointerOverlay) {
-            gamePointerOverlay=[[UIImageView alloc] initWithImage:gamePointerImage];
-            gamePointerOverlay.userInteractionEnabled=NO;
-            gamePointerOverlay.accessibilityElementsHidden=YES;
-            gamePointerOverlay.contentMode=UIViewContentModeScaleToFill;
-            gamePointerOverlay.layer.zPosition=10000;
-        }
-        [host addSubview:gamePointerOverlay];
-        Log(@"cursor_overlay installed host=%@ image=(%.0f,%.0f)",NSStringFromClass(host.class),
-            gamePointerImage.size.width,gamePointerImage.size.height);
-    }
-    cursorWidthUV=gamePointerImage.size.width/host.bounds.size.width;
-    cursorHeightUV=gamePointerImage.size.height/host.bounds.size.height;
-    cursorHotXUV=gamePointerHotspot.x/host.bounds.size.width;
-    cursorHotYUV=gamePointerHotspot.y/host.bounds.size.height;
-    if(mapRendersCursor.load()) {gamePointerOverlay.hidden=YES;return;}
-    CGFloat x=host.bounds.origin.x+(capturedPointer.x-bounds.origin.x)/bounds.size.width*host.bounds.size.width;
-    CGFloat y=host.bounds.origin.y+(capturedPointer.y-bounds.origin.y)/bounds.size.height*host.bounds.size.height;
-    CGRect frame=CGRectMake(x-gamePointerHotspot.x,y-gamePointerHotspot.y,
-        gamePointerImage.size.width,gamePointerImage.size.height);
-    if(gamePointerOverlay.image==gamePointerImage && CGRectEqualToRect(gamePointerOverlay.frame,frame) && !gamePointerOverlay.hidden) return;
-    [UIView performWithoutAnimation:^{
-        if(gamePointerOverlay.image!=gamePointerImage)gamePointerOverlay.image=gamePointerImage;
-        if(!CGRectEqualToRect(gamePointerOverlay.frame,frame))gamePointerOverlay.frame=frame;
-        if(gamePointerOverlay.hidden)gamePointerOverlay.hidden=NO;
-    }];
+    if (eventBounds) bounds = *eventBounds;
+    else if (!GameContentBounds(bounds)) { SetOwnedCursor(nil); return; }
+    CGPoint point = eventPoint ? *eventPoint : DesktopMouseLocation();
+    bool visible = !gameplayPointerStarted || WantsVisibleCursor();
+    SetOwnedCursor(visible && CGRectContainsPoint(bounds, point) ? (gameNativeCursor ?: loginNativeCursor) : nil);
 }
-static void ScheduleGameCursorShape(void) {
-    static std::atomic<bool> pending{false};
-    if(pending.exchange(true)) return;
-    dispatch_async(dispatch_get_main_queue(), ^{pending=false;ApplyGameCursorShape();});
-}
+
 static void ApplyNativeCursorVisibility(bool forceVisible=false) {
-    bool active=!ControllerOwnsGamePointer() && !forceVisible && !pointerCaptureSuspended && NativeBridge::IsForeground();
-    bool cameraHidden=active && !WantsVisibleCursor();
-    if(cameraHidden && !cameraCursorHidden) CenterDesktopPointer();
-    if(cameraHidden!=cameraCursorHidden)
-        Log(@"cursor_render visible=%d tab=%d centered_on_hide=%d",!cameraHidden,tabCursorRequested,cameraHidden);
-    cameraCursorHidden=cameraHidden;
-    // A transparent native shape remains invisible when UIKit balances its
-    // own hide/unhide calls. Do not compete with that process-wide counter.
-    if(active && UsesTransparentCursor() && originalCursorSet && transparentNativeCursor) {
-        // The locked camera and owned map drag already have a transparent
-        // cursor. Reinstall only if ownership or the current shape changes.
-        bool cameraLocked=cameraHidden && nativePointerCaptured &&
-            capturedNativeWindow && cursorLockMode.load()==1;
-        bool reuse=nativeShapeTransparent && (cameraLocked || DefersMapPointerPacket());
-        if(reuse) {
-            id current=((id (*)(id,SEL))objc_msgSend)(NSClassFromString(@"NSCursor"),sel_registerName("currentCursor"));
-            reuse=current==transparentNativeCursor;
-        }
-        if(!reuse) originalCursorSet(transparentNativeCursor,sel_registerName("set"));
-        else if(cameraLocked) {
-            static bool reported=false;
-            if(!reported) {
-                reported=true;
-                Log(@"camera_cursor_shape reused=1");
-            }
-        } else {
-            static unsigned reused=0;
-            if(++reused<=2)Log(@"map_cursor_shape reused=1 window_server_reset=0 web=0");
-        }
-        nativeShapeTransparent=true;
-    } else if(nativeShapeTransparent && originalCursorSet) {
-        id arrow=((id (*)(id,SEL))objc_msgSend)(NSClassFromString(@"NSCursor"),sel_registerName("arrowCursor"));
-        originalCursorSet(arrow,sel_registerName("set"));nativeShapeTransparent=false;
-    }
+    bool hidden = !forceVisible && NativeGameWindow() && !ControllerOwnsGamePointer() &&
+        gameplayPointerStarted && !pointerCaptureSuspended && NativeBridge::IsForeground() && !WantsVisibleCursor();
+    if (hidden && !cameraCursorHidden && nativePointerCaptured) CenterDesktopPointer();
+    cameraCursorHidden = hidden;
+    if (forceVisible) SetOwnedCursor(nil);
+    else UpdateCursorImage();
 }
+
 static void RefreshPointerStateNow(void) {
     ReconcilePointerCapture();
     ApplyNativeCursorVisibility();
@@ -487,11 +369,72 @@ static void RefreshPointerStateNow(void) {
         for(UIViewController *child in window.rootViewController.childViewControllers)
             [child setNeedsUpdateOfPrefersPointerLocked];
     }
-    ApplyGameCursorShape();
+
 }
 static void RefreshPointerLock(void) {
     if(NSThread.isMainThread) RefreshPointerStateNow();
     else dispatch_async(dispatch_get_main_queue(), ^{RefreshPointerStateNow();});
+}
+
+static void SetMacPointerHost(id window) {
+    bool suspended = window == nil;
+    if (window == gameHostWindow && NativeBridge::macWindowSuspended.load() == suspended) return;
+    NativeBridge::macWindowSuspended = suspended;
+    gameHostWindow = window;
+    waitForContent = true;
+    desktopNativePressInContent = false;
+    tabCursorRequested = false;
+    desktopEscapeGuard.reset();
+    desktopNoticeEscapeOwned = false;
+    desktopMapFrame.cancel();
+    NativeBridge::Deactivate();
+    NativeBridge::handoffMouseBlocked.fetch_or(static_cast<uint32_t>(
+        MacPointerSend<NSUInteger>(NSClassFromString(@"NSEvent"), "pressedMouseButtons")));
+    ReleasePointerCapture();
+    ReleaseFreePointerTracking();
+    desktopDragSequence.reset();
+    desktopMotionSequence.reset();
+    desktopTouchHistory.reset();
+    CGPoint point = DesktopMouseLocation();
+    desktopMotion.reset({point.x,point.y});
+    RefreshPointerStateNow();
+    Log(@"cursor_host game=%d window=%@", !suspended, NSStringFromClass([window class]));
+}
+
+static void RefreshMacPointerHost(id eventWindow) {
+    id app = PointerApplication();
+    id key = MacPointerSend(app, "keyWindow");
+    bool eligible = !menuTrackingDepth && MacPointerSend<BOOL>(app, "isActive") &&
+        !MacPointerSend(app, "modalWindow") && IsCatalystGameWindow(key);
+    if (eligible && eventWindow && eventWindow != key) eligible = false;
+    SetMacPointerHost(eligible ? key : nil);
+}
+
+static void InstallMacPointerHost() {
+    static bool installed;
+    if (installed) return;
+    installed = true;
+    InstallNativeCursorGuard();
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    for (NSString *name in @[@"NSMenuDidBeginTrackingNotification", @"NSMenuDidEndTrackingNotification",
+        @"NSWindowDidBecomeKeyNotification", @"NSWindowDidResignKeyNotification",
+        @"NSWindowWillBeginSheetNotification", @"NSWindowDidEndSheetNotification",
+        @"NSApplicationDidBecomeActiveNotification", @"NSApplicationWillResignActiveNotification"]) {
+        [center addObserverForName:name object:nil queue:nil usingBlock:^(NSNotification *note) {
+            if ([note.name isEqualToString:@"NSMenuDidBeginTrackingNotification"]) {
+                ++menuTrackingDepth;
+                SetMacPointerHost(nil);
+            } else if ([note.name isEqualToString:@"NSMenuDidEndTrackingNotification"]) {
+                if (menuTrackingDepth) --menuTrackingDepth;
+                dispatch_async(dispatch_get_main_queue(), ^{ RefreshMacPointerHost(); });
+            } else if ([note.name isEqualToString:@"NSApplicationWillResignActiveNotification"] ||
+                (note.object == gameHostWindow && ([note.name isEqualToString:@"NSWindowDidResignKeyNotification"] ||
+                                                   [note.name isEqualToString:@"NSWindowWillBeginSheetNotification"]))) {
+                SetMacPointerHost(nil);
+            } else RefreshMacPointerHost();
+        }];
+    }
+    RefreshMacPointerHost();
 }
 static void SetDesktopTabHeld(bool held) {
     auto update=^{
@@ -499,8 +442,8 @@ static void SetDesktopTabHeld(bool held) {
         if(tabCursorRequested==held) return;
         tabCursorRequested=held;RefreshPointerStateNow();
         CGRect bounds={};bool located=GameContentBounds(bounds);
-        Log(@"cursor_tab held=%d visible=%d capture=%d overlay=%d normalized=(%.3f,%.3f)",
-            held,WantsVisibleCursor(),nativePointerCaptured,gamePointerOverlay && !gamePointerOverlay.hidden,
+        Log(@"cursor_tab held=%d visible=%d capture=%d native_arrow=%d normalized=(%.3f,%.3f)",
+            held,WantsVisibleCursor(),nativePointerCaptured,ownedNativeCursor && ownedNativeCursor != transparentNativeCursor,
             located?(capturedPointer.x-bounds.origin.x)/bounds.size.width:0,
             located?(capturedPointer.y-bounds.origin.y)/bounds.size.height:0);
     };
@@ -637,6 +580,15 @@ static void ObservePrimaryEvent(id window,id event,NSUInteger type) {
 }
 static void DispatchDesktopWindowEvent(id window,SEL selector,id event) {
     NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
+    id target = window;
+    if (target != gameHostWindow || NativeBridge::macWindowSuspended.load()) RefreshMacPointerHost(target);
+    if (!NativeGameWindow() || (target && target != gameHostWindow)) {
+        originalWindowSendEvent(window, selector, event);
+        return;
+    }
+    if (type == 5 || type == 8 || type == 9 || type == 17) {
+        if (!gameplayPointerStarted || type != 5) UpdateCursorImage();
+    }
     ObservePrimaryEvent(window,event,type);
     if (NativeBridge::accountSheetActive.load()) {
         originalWindowSendEvent(window,selector,event);
@@ -695,13 +647,22 @@ static bool DispatchOwnedMapMotion(id event,NSUInteger type) {
     if(frame.position(point.x,point.y,u,v) &&
        desktopMapFrame.record(frame,NativeBridge::mapFocusRevision.load(),point.x,point.y)) {
         NativeBridge::Position(u,v);
-        if(!mapRendersCursor.load()) QueueMapPointerPaint();
     }
     NativeBridge::Move(dx,-dy);desktopMapMotionBatched=true;
     return true;
 }
 static void DispatchDesktopApplicationEvent(id application,SEL selector,id event) {
     NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
+    id target = MacPointerSend(event, "window");
+    if (target != gameHostWindow || NativeBridge::macWindowSuspended.load()) RefreshMacPointerHost(target);
+    if (!NativeGameWindow() || (target && target != gameHostWindow)) {
+        originalApplicationSendEvent(application, selector, event);
+        return;
+    }
+    if ((type==1 || type==2) && TitleQuit::Handle(target,event,type==1)) return;
+    if (type == 5 || type == 8 || type == 9 || type == 17) {
+        if (!gameplayPointerStarted || type != 5) UpdateCursorImage();
+    }
     if(type==1 || type==2)
         ObservePrimaryEvent(((id (*)(id,SEL))objc_msgSend)(event,sel_registerName("window")),event,type);
     if ((type==10 || type==11) ? NativeAccountInput::Refresh() : NativeBridge::accountSheetActive.load()) {
@@ -729,6 +690,7 @@ static void DispatchDesktopApplicationEvent(id application,SEL selector,id event
     originalApplicationSendEvent(application,selector,event);
 }
 static void InstallSystemMouseMotion(void) {
+    InstallMacPointerHost();
     // Mac Catalyst's immediate dragging route can bypass local monitors. Read
     // each drag at NSWindow's public dispatch entry, before UIKit sees it.
     // Mouse movement without a button retains the user-confirmed monitor path.
@@ -755,6 +717,7 @@ static void InstallSystemMouseMotion(void) {
     id (^handler)(id)=^id(id event) {
         NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
         if (NativeBridge::accountSheetActive.load()) return event;
+        if (!NativeGameWindow()) return event;
         if(type==22) {
             if(!originalApplicationSendEvent && !originalWindowSendEvent) ProcessDesktopScroll(event,DesktopScrollKey(event));
             return event;
@@ -813,17 +776,20 @@ static void SetCursorTexture(void *texture,const float *hotspot,int mode,float u
     static void *previousTexture;
     CGPoint point=CGPointMake(hotspot?hotspot[0]:0,hotspot?hotspot[1]:0);
     if(!texture) {
-        previousTexture=nullptr;gameCursorTextureID=0;
+        previousTexture=nullptr;
         dispatch_async(dispatch_get_main_queue(), ^{
-            gamePointerImage=nil;gamePointerOverlay.hidden=YES;RefreshPointerStateNow();
+            gameNativeCursor=nil;gameCursorPNG=nil;RefreshPointerStateNow();
         });
         Log(@"cursor_texture cleared");return;
     }
     if(texture==previousTexture) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            gamePointerHotspot=point;
-            if(gamePointerImage) ConfigureDesktopWebStyle(nil,gamePointerImage.size,point);
-            ApplyGameCursorShape();
+            if (gameCursorPNG && !CGPointEqualToPoint(gameCursorHotspot, point)) {
+                gameCursorHotspot = point;
+                ConfigureDesktopWebStyle(gameCursorPNG, gameCursorSize, point);
+                gameNativeCursor = desktopWebGoldCursor;
+                UpdateCursorImage();
+            }
         });
         return;
     }
@@ -841,15 +807,13 @@ static void SetCursorTexture(void *texture,const float *hotspot,int mode,float u
     uint64_t size=*(uint64_t *)((char *)array+24);
     if(!size || size>4*1024*1024) {Log(@"cursor_texture invalid_size=%llu",size);return;}
     NSData *png=[NSData dataWithBytes:(char *)array+32 length:size];
-    void *idMethod=lookup(*(void **)texture,"GetInstanceID",0,0);
-    void *identity=idMethod?invoke(idMethod,texture,nullptr,&exception):nullptr;
-    gameCursorTextureID=identity?*(int *)((char *)identity+16):0;
     previousTexture=texture;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIImage *img=[UIImage imageWithData:png];
         if(!img) {Log(@"cursor_texture image_decode_failed");return;}
-        gamePointerImage=img;gamePointerHotspot=point;
+        gameCursorPNG=png;gameCursorSize=img.size;gameCursorHotspot=point;
         ConfigureDesktopWebStyle(png,img.size,point);
+        gameNativeCursor = desktopWebGoldCursor;
         [png writeToFile:[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/GenshinDesktopCursor.png"] atomically:YES];
         Log(@"cursor_texture installed bytes=%llu hotspot=(%.1f,%.1f)",size,point.x,point.y);
         RefreshPointerStateNow();
@@ -902,7 +866,6 @@ static void InstallCursorBridge(void) {
         ReconcilePointerCapture();
         if(visible!=previousVisible) {previousVisible=visible;RefreshPointerStateNow();}
         ApplyNativeCursorVisibility();
-        ApplyGameCursorShape();
         if(!ControllerOwnsGamePointer() && !nativePointerCaptured && !pointerCaptureSuspended && cursorLockMode.load()==1 && !visible && NativeBridge::IsForeground())
             for(UIWindow *window in UIApplication.sharedApplication.windows)
                 if(!window.windowScene.pointerLockState.locked)
@@ -917,20 +880,20 @@ static void InstallCursorBridge(void) {
 @implementation DesktopPointerObserver
 - (void)hover:(UIHoverGestureRecognizer *)recognizer {
     if(ControllerOwnsGamePointer()) return;
-    if(nativePointerCaptured) {ScheduleGameCursorShape();return;}
+    if(!NativeGameWindow() || nativePointerCaptured) return;
     if(gameplayPointerStarted && WantsVisibleCursor()) {SyncFreeDesktopPointer();return;}
     UIView *view=recognizer.view;
     if (!view || view.bounds.size.width<=0 || view.bounds.size.height<=0) return;
     CGPoint point=[recognizer locationInView:view];
     NativeBridge::Position(point.x/view.bounds.size.width,1.0-point.y/view.bounds.size.height);
-    ScheduleGameCursorShape();
+    UpdateCursorImage();
 }
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)first shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)second {
     return YES;
 }
 - (UIPointerStyle *)pointerInteraction:(UIPointerInteraction *)interaction styleForRegion:(UIPointerRegion *)region {
     if(ControllerOwnsGamePointer()) return nil;
-    return (!WantsVisibleCursor() || (gamePointerImage && UsesTransparentCursor()))?[UIPointerStyle hiddenPointerStyle]:nil;
+    return NativeGameWindow() && nativePointerCaptured && !WantsVisibleCursor() ? [UIPointerStyle hiddenPointerStyle] : nil;
 }
 @end
 
@@ -961,12 +924,6 @@ static void UpdateNativeOverlayState(void) {
             }
         }
     }
-    UIWindow *previousWishWindow=wishPointerWindow,*nextWishWindow=nil;
-    for(id web in webs)
-        if([web isKindOfClass:UIView.class] && DesktopWishHistoryLocation(web,"URL")) {
-            nextWishWindow=[(UIView *)web window];if(nextWishWindow)break;
-        }
-    wishPointerWindow=nextWishWindow;
     bool appearing=webs.count>0 && !NativeBridge::nativeOverlayActive;
     if(appearing) for(id web in webs) DescribeDesktopWebEscapeHost(web);
     for(id web in webs)
@@ -977,12 +934,10 @@ static void UpdateNativeOverlayState(void) {
     if(!visible) NativeBridge::nativeNoticeEscapeActive=false;
     else if(appearing || !NativeBridge::nativeNoticeEscapeActive)
         NativeBridge::nativeNoticeEscapeActive=(bool)DesktopWebEscapeAction();
-    if(visible!=before || previousWishWindow!=nextWishWindow) {
+    if(visible!=before) {
         Log(@"native_web_gold_cursor visible=%d",visible);
         Log(@"native_web_focus ui_state=%ld mac_active=%d capture_suspended=%d",(long)UIApplication.sharedApplication.applicationState,DesktopWebAppIsActive(),pointerCaptureSuspended);
         RefreshPointerStateNow();
-        if(visible && !wishPointerWindow && gamePointerOverlay.superview) [gamePointerOverlay.superview bringSubviewToFront:gamePointerOverlay];
-        if(visible) Log(@"native_web_cursor existing_unity_overlay=%d wish_window_overlay=%d input_interception=0",!wishPointerWindow,wishPointerWindow!=nil);
         if(visible) Log(@"notice_escape available=%d",NativeBridge::nativeNoticeEscapeActive.load());
         if(visible && desktopWebGoldCursor && originalCursorSet)
             SetGuardedCursor(desktopWebGoldCursor,sel_registerName("set"));

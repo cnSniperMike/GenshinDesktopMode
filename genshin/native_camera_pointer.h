@@ -1,3 +1,4 @@
+#include "map_flick.h"
 #include "map_mouse_gesture.h"
 #include "map_projection.h"
 
@@ -12,6 +13,7 @@ static bool installed;
 static void *trackedTouch,*trackedCamera;
 static DesktopMapMouseGesture drag;
 static std::atomic<bool> mapActive{false};
+static DesktopMapFlick mapFlick;
 
 static void *Method(void *cls,const char *name,const char *result,
                     std::initializer_list<const char *> parameters) {
@@ -35,6 +37,7 @@ static void *cameraGetter,*cameraRect,*getPivot,*getPosition,*getWidth,*getHeigh
 static bool cameraField,ready,usingAnchor;
 static DesktopMapProjection::Viewport view;
 static Vector3 mapPoint;
+static Vector2 followPoint;
 static unsigned samples,limited;
 
 static Vector3 read(void *method,void *object) {
@@ -79,6 +82,7 @@ static void Move(void *map,Vector3 delta) {
     ((void (*)(void *,Vector3,void *))ManagedMethodCode(moveCamera))(map,delta,moveCamera);
 }
 static void Follow(void *map,Vector2 pixel) {
+    followPoint=pixel;
     auto f=Frustum(map);
     if(!f.valid())return;
     Vector3 pivot=read(getPivot,map),under=f.at(pixel.x,pixel.y,pivot);
@@ -98,12 +102,12 @@ static void Follow(void *map,Vector2 pixel) {
     } else ++samples;
 }
 static void Finish() {
-    if(usingAnchor && (samples||limited))
+    if(diagnosticsEnabled && usingAnchor && (samples||limited))
         Log(@"native_map_anchor samples=%u boundary_samples=%u plane=map_frustum",samples,limited);
     usingAnchor=false;
 }
 }
-#include "map_drag_cursor.h"
+
 static bool RegisterOnlyPrologue(const void *code) {
     const uint32_t *p=(const uint32_t *)code;
     for(unsigned i=0;i<4;++i) {
@@ -133,14 +137,33 @@ static void Action(void *touch,size_t offset) {
     void *action=*(void **)((char *)touch+offset);
     if(action) Call(lookup(*(void **)action,"Invoke",0,0),action);
 }
-static void End(void *touch,void *camera) {
-    // Mouse release has no touch momentum. Keep the game's own boundary
-    // recovery state, with zero residual velocity and no delayed release.
-    speed(camera,Vector3{},speedMethod);Goto(camera,2);
-    Action(touch,80);
-    NativeBridge::mapDragActive=false;
+static void FinishCameraPan(void *camera) {
+    speed(camera,Vector3{},speedMethod);
+    Goto(camera,2);
     Anchor::Finish();
-    Log(@"native_camera_mouse drag=0 source=mouse_absolute_pixels touch_objects=0");
+}
+
+// Keep the same camera mode and pan coordinates through mouse-up. The
+// physical drag ends immediately; boundary recovery starts after the coast.
+static void CoastFrame(void *camera,int height,double now) {
+    auto delta=mapFlick.advance(height,now);
+    if (delta.x || delta.y) {
+        if (Anchor::usingAnchor)
+            Anchor::Follow(camera,{Anchor::followPoint.x+delta.x,Anchor::followPoint.y+delta.y});
+        else swipe(camera,{delta.x,delta.y},swipeMethod);
+    }
+    if (!mapFlick.active()) FinishCameraPan(camera);
+}
+static void StopTracking(void *touch,void *camera) {
+    const bool wasDragging=drag.cancel();
+    const bool wasCoasting=mapFlick.active();
+    mapFlick.cancel();
+    if (camera && (wasDragging || wasCoasting)) {
+        FinishCameraPan(camera);
+        if (wasDragging) Action(touch,80);
+    }
+    Anchor::usingAnchor=false;
+    NativeBridge::mapDragActive=false;
 }
 static bool HasWidget(void *pointer) {
     void *hit=Property(pointer,"get_pointerEnter");
@@ -209,20 +232,16 @@ static void Update(void *object,void *method) {
                     monoOffset=offset(field);
         }
     }
+    void *camera=*(void **)(touch+56);
     if(!monoOffset) {
         if(object==trackedTouch) {
-            if(drag.cancel()&&trackedCamera) End(object,trackedCamera);
-            Anchor::Finish();
-            MapDragCursor::Release();
-            trackedTouch=trackedCamera=nullptr;mapActive=false;
-            NativeBridge::mapDragActive=false;
+            StopTracking(object,camera==trackedCamera?camera:nullptr);
+            trackedTouch=trackedCamera=nullptr;
+            mapActive=false;
         }
         return;
     }
     void *mono=*(void **)(context+monoOffset);
-    // This active Unity callback owns the touch proxy and camera lifetime.
-    // No stale scene-wide component pointers are retained across callbacks.
-    void *camera=*(void **)(touch+56);
     static void *monoClass,*activeMethod;
     static bool (*isActive)(void *,void *);
     if(mono&&*(void **)mono!=monoClass) {
@@ -230,71 +249,83 @@ static void Update(void *object,void *method) {
         activeMethod=Method(monoClass,"get_isActiveAndEnabled","Boolean",{});
         isActive=activeMethod?(decltype(isActive))ManagedMethodCode(activeMethod):nullptr;
     }
-    bool active=mono&&camera&&isActive&&NativeBridge::nativeDesktopMouseUI.load()&& !NativeBridge::controllerInputActive &&
-        !NativeBridge::nativeOverlayActive&&isActive(mono,activeMethod);
-    if(!active && object!=trackedTouch) return;
-    if(trackedTouch && (trackedTouch!=object || trackedCamera!=camera)) {
-        drag.cancel();
-        Anchor::Finish();MapDragCursor::Release();
-        drag.held=(NativeBridge::physicalMouseSnapshot.load()&1)!=0;
-        NativeBridge::mapDragActive=false;
+    const bool active=mono && camera && isActive && NativeBridge::nativeDesktopMouseUI &&
+        !NativeBridge::controllerInputActive && !NativeBridge::nativeOverlayActive && isActive(mono,activeMethod);
+    if (!active && object!=trackedTouch) return;
+    const bool held=(NativeBridge::physicalMouseSnapshot.load() & 1)!=0;
+    if (trackedTouch && (trackedTouch!=object || trackedCamera!=camera)) {
+        StopTracking(object,nullptr);
+        drag.held=held;
     }
     trackedTouch=object;trackedCamera=camera;mapActive=active;
+    if (!active || !nativeInputManager || !NativeBridge::screenWidth || !NativeBridge::screenHeight) {
+        StopTracking(object,camera);
+        drag.held=held;
+        return;
+    }
+    if (!held && !drag.held && !mapFlick.active()) return;
     static void *described;
     if(active&&camera!=described) {
         described=camera;
         Log(@"native_camera_mouse map_bound=1 typed_view_offset=%zu camera=%p",monoOffset,camera);
     }
-    if(!camera||!nativeInputManager||!NativeBridge::screenWidth||!NativeBridge::screenHeight) return;
-    bool held=(NativeBridge::physicalMouseSnapshot.load()&1)!=0;
-    bool fresh=held&&!drag.held;
     bool foreground=!pointerCaptureSuspended&&NativeBridge::IsForeground();
     float x=*(float *)(nativeInputManager+0xd0),y=*(float *)(nativeInputManager+0xd4);
     const auto [w,h]=NativeBridge::screenMetrics.read();
     CGRect bounds{};
     bool inside=x>=0&&y>=0&&x<w&&y<h;
-    bool cursorVisibleInMap=active && foreground && WantsVisibleCursor() && inside;
-    if(!cursorVisibleInMap)MapDragCursor::Hide();
-    if(!fresh && !drag.armed) {
-        drag.held=held;
-        if(cursorVisibleInMap)MapDragCursor::Draw(mono,{x,y},w,h);
-        return;
-    }
     auto frame=desktopMapFrame.snapshot();
     if(frame.active && frame.focus==NativeBridge::mapFocusRevision.load())
         bounds=CGRectMake(frame.x,frame.y,frame.width,frame.height);
     else if(inside) inside=GameContentBounds(bounds);
     bool available=active&&foreground&&WantsVisibleCursor()&&inside;
+    const bool fresh=held&&!drag.held;
     if(fresh&&available)available=drag.viewport.capture(w,h,bounds.size.width,bounds.size.height);
     else if(drag.armed)available=available&&drag.viewport.matches(w,h,bounds.size.width,bounds.size.height);
-    auto step=drag.sample(held,available,fresh&&available&&MapSurface(object,false),
-        NativeBridge::mapFocusRevision.load(),x,y);
-    if(fresh && drag.armed) Anchor::Begin(camera,{x,y});
-    if(step.begin) {
-        speed(camera,Vector3{},speedMethod);Goto(camera,1);Action(object,72);
+    const double now=CACurrentMediaTime();
+    const auto focus=NativeBridge::mapFocusRevision.load();
+    const bool sameViewport=drag.viewport.matches(w,h,bounds.size.width,bounds.size.height);
+    if (mapFlick.active()) {
+        if (!held && available && sameViewport && focus==drag.revision) {
+            CoastFrame(camera,h,now);
+            return;
+        }
+        mapFlick.cancel();
+        FinishCameraPan(camera);
+    }
+    if (fresh) {
+        mapFlick.begin(now);
+    }
+    const bool released=!held && available && sameViewport && focus==drag.revision;
+    auto step=drag.sample(held,available,fresh&&available&&MapSurface(object,false),focus,x,y);
+    if (fresh && drag.armed) Anchor::Begin(camera,{x,y});
+    if (step.begin) {
+        speed(camera,Vector3{},speedMethod);
+        Goto(camera,1);
+        Action(object,72);
         NativeBridge::mapDragActive=true;
-        Log(@"native_camera_mouse drag=1 anchored=%d source=window_event touch_objects=0",Anchor::usingAnchor);
     }
-    if(Anchor::usingAnchor && (drag.panning || (step.end && available && drag.revision==NativeBridge::mapFocusRevision.load())))
+    const float dx=step.dx, dy=step.dy;
+    if (drag.panning || dx || dy) mapFlick.dragFrame(dx,dy,h,now);
+    if (Anchor::usingAnchor && (drag.panning || (step.end && released)))
         Anchor::Follow(camera,{x,y});
-    else if(step.dx || step.dy) {
-        swipe(camera,Vector2{step.dx,step.dy},swipeMethod);
-        static uint64_t pans=0;
-        if(++pans<=3||pans%240==0)
-            Log(@"native_camera_mouse_pan frame=%llu delta=(%.2f,%.2f) virtual_touch=0",pans,step.dx,step.dy);
+    else if (dx || dy) swipe(camera,{dx,dy},swipeMethod);
+    if (step.end) {
+        const bool coast=released && mapFlick.release(now);
+        if (!coast) FinishCameraPan(camera);
+        Action(object,80);
+        NativeBridge::mapDragActive=false;
+        if (coast) CoastFrame(camera,h,now);
     }
-    if(cursorVisibleInMap)MapDragCursor::Draw(mono,{x,y},w,h);
-    if(step.end) End(object,camera);
-    if(step.click) {Anchor::Finish();Click(object,Vector2{x,y});}
-    if(!drag.armed && !step.end && !step.click && Anchor::usingAnchor) Anchor::Finish();
+    if (step.click) {Anchor::Finish();Click(object,{x,y});}
+    if (!drag.armed && !mapFlick.active() && Anchor::usingAnchor) Anchor::Finish();
 }
 static void Disable(void *object,void *method) {
     if(object==trackedTouch) {
-        if(drag.cancel()&&trackedCamera) End(object,trackedCamera);
-        Anchor::Finish();
-        MapDragCursor::Release();
-        trackedTouch=trackedCamera=nullptr;mapActive=false;
-        NativeBridge::mapDragActive=false;
+        void *camera=*(void **)((char *)object+56);
+        StopTracking(object,camera==trackedCamera?camera:nullptr);
+        trackedTouch=trackedCamera=nullptr;
+        mapActive=false;
     }
     originalDisable(object,method);
 }

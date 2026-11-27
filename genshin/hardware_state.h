@@ -30,7 +30,10 @@ static bool (*systemKeyState)(int,uint16_t);
 static std::array<bool,350> hardwareVerified{};
 static std::atomic<uint64_t> hardwareDisagreements{0};
 
+static std::atomic<bool> macWindowSuspended{true};
+
 static bool IsForeground(void) {
+    if (macWindowSuspended.load()) return false;
     if (UIApplication.sharedApplication.applicationState!=UIApplicationStateActive) return false;
     // Catalyst can retain an active UIScene while its macOS window is inactive.
     Class cls=NSClassFromString(@"NSApplication");
@@ -46,6 +49,10 @@ static KeyboardState::Keys KeyboardSnapshot(bool foreground) {
     unsigned gcMovement=0,hardwareMovement=0;
     for (int hid=4;hid<=231;++hid) {
         int key=UnityKeyForHID(hid);if (!key) continue;
+        // A delivered AppKit edge already wins reconciliation until focus changes.
+        // Skip redundant hardware queries for those keys on the normal input path.
+        auto known = keyboardSources.native[key].load(std::memory_order_relaxed);
+        if (known && !diagnosticsEnabled) { result[key] = known == 2; continue; }
         bool gcDown=input && [input buttonForKeyCode:(GCKeyCode)hid].pressed;
         bool down=gcDown;
         unsigned movement=key==97?1:key==100?2:key==115?4:key==119?8:0;

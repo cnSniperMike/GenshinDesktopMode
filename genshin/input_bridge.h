@@ -193,7 +193,8 @@ static void EnablePrimaryEvents(void) {
 static void PrimaryEvent(bool down,bool eligible,DesktopPrimaryButton::Point point) {
     std::lock_guard<std::mutex> guard(mutex);
     if(!down) handoffMouseBlocked.fetch_and(~1u);
-    if(!primaryUsesEvents || controllerInputActive || nativeOverlayActive || !keyboard.active) return;
+    if(!primaryUsesEvents || controllerInputActive || nativeOverlayActive || !keyboard.active ||
+       (down && (handoffMouseBlocked.load() & 1u))) return;
     // A real new AppKit down is authoritative even if a trackpad never
     // exposed its previous tap in the physical button mask.
     primaryButton.event(down,eligible,point);
@@ -224,7 +225,7 @@ static void Update(char *manager) {
     uint64_t pointerRevision;
     {
         std::lock_guard<std::mutex> guard(mutex);
-        foreground=foreground && !accountSheetActive.load();
+        foreground=foreground && !accountSheetActive.load() && !macWindowSuspended.load();
         if(keyboard.active!=foreground) {
             keyboard.focus(foreground);
             CancelMouseLocked();deltaX=deltaY=0;scroll.cancel();
